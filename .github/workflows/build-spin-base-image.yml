@@ -1,0 +1,95 @@
+# Build & publish the n8n v2 base image consumed by spin-platform.
+#
+# Add this file at .github/workflows/build-spin-base-image.yml on the
+# release/2.33.3-with-concurrency-fix branch of pratikshah3/n8n — a workflow
+# can only run from a branch it exists on.
+#
+# Publishes ghcr.io/pratikshah3/n8n:2.33.3-concurrency-fix, which
+# spin-platform's .github/workflows/ecs-n8n.yaml passes to the spin-n8n
+# docker build as N8N_BASE_IMAGE.
+#
+# ONE-TIME SETUP after the first publish: make the GHCR package public
+# (github.com → your profile → Packages → n8n → Package settings → Change
+# visibility → Public). GHCR packages default to private even on public
+# repos, and spin-platform CI pulls this image anonymously.
+
+name: 'Build and publish spin base image to GHCR'
+
+on:
+  push:
+    branches:
+      - release/2.33.3-with-concurrency-fix
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/n8n
+  IMAGE_TAG: 2.33.3-concurrency-fix
+
+jobs:
+  build-and-push:
+    name: Build n8n and push image to GHCR
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Free up runner disk space
+        run: |
+          # The workspace install + compiled output + image don't fit
+          # alongside the runner's preinstalled toolchains.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Reads the pnpm version from the packageManager field in package.json
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.18.0'
+          cache: 'pnpm'
+
+      # Produces the pruned production deployment in compiled/, which
+      # docker/images/n8n/Dockerfile copies into the image.
+      - name: Build n8n
+        env:
+          NODE_OPTIONS: '--max-old-space-size=7168'
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build:n8n
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        run: |
+          N8N_VERSION=$(node -p "require('./package.json').version")
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          echo "Building $IMAGE_NAME:$IMAGE_TAG (n8n $N8N_VERSION @ $SHORT_SHA)"
+
+          # No layer caching on purpose: scripts/build-n8n.mjs stamps a fresh
+          # buildTime into compiled/build-manifest.json, so the COPY layer
+          # (and everything after it) invalidates on every run anyway.
+          # The extra sha tag gives an immutable reference per build for
+          # rollbacks, alongside the moving tag spin-platform consumes.
+          docker buildx build \
+              --platform linux/amd64 \
+              --build-arg N8N_VERSION=$N8N_VERSION \
+              --build-arg N8N_RELEASE_TYPE=stable \
+              -f docker/images/n8n/Dockerfile . \
+              -t $IMAGE_NAME:$IMAGE_TAG \
+              -t $IMAGE_NAME:$IMAGE_TAG-$SHORT_SHA \
+              --push
