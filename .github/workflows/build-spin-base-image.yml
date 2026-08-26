@@ -4,9 +4,17 @@
 # release/2.33.3-with-concurrency-fix branch of pratikshah3/n8n — a workflow
 # can only run from a branch it exists on.
 #
-# Publishes ghcr.io/pratikshah3/n8n:2.33.3-concurrency-fix, which
-# spin-platform's .github/workflows/ecs-n8n.yaml passes to the spin-n8n
-# docker build as N8N_BASE_IMAGE.
+# Publishes the multi-arch (linux/amd64 + linux/arm64) manifest
+# ghcr.io/pratikshah3/n8n:2.33.3-concurrency-fix, which spin-platform's
+# .github/workflows/ecs-n8n.yaml passes to the spin-n8n docker build as
+# N8N_BASE_IMAGE. The arm64 variant also lets developers run the image
+# directly on Apple Silicon without building it themselves.
+#
+# Each architecture is built on a native runner (arm64 on GitHub's free
+# public-repo ARM runners) rather than under QEMU — the Dockerfile's builder
+# stage compiles sqlite3 and isolated-vm from source, which is unusably slow
+# emulated. The per-arch images are pushed by digest and joined into one
+# manifest list by the `merge` job, so the published tags stay uncluttered.
 #
 # ONE-TIME SETUP after the first publish: make the GHCR package public
 # (github.com → your profile → Packages → n8n → Package settings → Change
@@ -30,10 +38,41 @@ env:
   IMAGE_TAG: 2.33.3-concurrency-fix
 
 jobs:
-  build-and-push:
-    name: Build n8n and push image to GHCR
+  prepare:
+    name: Resolve version and commit
     runs-on: ubuntu-latest
+    outputs:
+      n8n_version: ${{ steps.meta.outputs.n8n_version }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      # Resolved once and shared, so every job in the run agrees on the tag
+      # even if the branch moves mid-run.
+      - name: Resolve build metadata
+        id: meta
+        run: |
+          echo "n8n_version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build n8n and push ${{ matrix.arch }} image to GHCR
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Free up runner disk space
         run: |
@@ -44,6 +83,8 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       # Reads the pnpm version from the packageManager field in package.json
       - name: Setup pnpm
@@ -74,22 +115,81 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push image
+      - name: Build and push image by digest
+        id: build
+        env:
+          N8N_VERSION: ${{ needs.prepare.outputs.n8n_version }}
+          SHORT_SHA: ${{ needs.prepare.outputs.short_sha }}
+          PLATFORM: ${{ matrix.platform }}
         run: |
-          N8N_VERSION=$(node -p "require('./package.json').version")
-          SHORT_SHA=$(git rev-parse --short=7 HEAD)
-          echo "Building $IMAGE_NAME:$IMAGE_TAG (n8n $N8N_VERSION @ $SHORT_SHA)"
+          echo "Building $IMAGE_NAME for $PLATFORM (n8n $N8N_VERSION @ $SHORT_SHA)"
 
           # No layer caching on purpose: scripts/build-n8n.mjs stamps a fresh
           # buildTime into compiled/build-manifest.json, so the COPY layer
           # (and everything after it) invalidates on every run anyway.
-          # The extra sha tag gives an immutable reference per build for
-          # rollbacks, alongside the moving tag spin-platform consumes.
+          # Pushed untagged, by digest only — the `merge` job assembles the
+          # tags from the per-arch digests into a single manifest list.
           docker buildx build \
-              --platform linux/amd64 \
-              --build-arg N8N_VERSION=$N8N_VERSION \
+              --platform "$PLATFORM" \
+              --build-arg N8N_VERSION="$N8N_VERSION" \
               --build-arg N8N_RELEASE_TYPE=stable \
               -f docker/images/n8n/Dockerfile . \
-              -t $IMAGE_NAME:$IMAGE_TAG \
-              -t $IMAGE_NAME:$IMAGE_TAG-$SHORT_SHA \
-              --push
+              --output "type=image,name=$IMAGE_NAME,push-by-digest=true,name-canonical=true,push=true" \
+              --metadata-file metadata.json
+
+          DIGEST=$(jq -r '."containerimage.digest"' metadata.json)
+          echo "Pushed $IMAGE_NAME@$DIGEST"
+          mkdir -p /tmp/digests
+          echo -n "$DIGEST" > "/tmp/digests/${{ matrix.arch }}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish multi-arch manifest
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push manifest list
+        env:
+          SHORT_SHA: ${{ needs.prepare.outputs.short_sha }}
+        run: |
+          # One manifest list over both per-arch digests, so `docker pull`
+          # resolves the right variant automatically.
+          # The extra sha tag gives an immutable reference per build for
+          # rollbacks, alongside the moving tag spin-platform consumes.
+          SOURCES=()
+          for FILE in /tmp/digests/*; do
+            SOURCES+=("$IMAGE_NAME@$(cat "$FILE")")
+          done
+          echo "Joining ${SOURCES[*]}"
+
+          docker buildx imagetools create \
+              -t "$IMAGE_NAME:$IMAGE_TAG" \
+              -t "$IMAGE_NAME:$IMAGE_TAG-$SHORT_SHA" \
+              "${SOURCES[@]}"
+
+      - name: Inspect published manifest
+        run: docker buildx imagetools inspect "$IMAGE_NAME:$IMAGE_TAG"
