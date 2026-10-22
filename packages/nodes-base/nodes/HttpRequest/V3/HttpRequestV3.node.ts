@@ -398,9 +398,14 @@ export class HttpRequestV3 implements INodeType {
 						let knownLength: number | undefined;
 
 						if (binaryData.id) {
-							uploadData = await this.helpers.getBinaryStream(binaryData.id);
 							const metadata = await this.helpers.getBinaryMetadata(binaryData.id);
 							knownLength = metadata.fileSize;
+							// form-data treats `knownLength: 0` as unknown and then fails to measure the
+							// stream, so the request goes out without a Content-Length header
+							uploadData =
+								knownLength === 0
+									? Buffer.alloc(0)
+									: await this.helpers.getBinaryStream(binaryData.id);
 						} else {
 							uploadData = Buffer.from(binaryData.data, BINARY_ENCODING);
 						}

@@ -1,4 +1,5 @@
 import FormData from 'form-data';
+import { Readable } from 'node:stream';
 import type {
 	IExecuteFunctions,
 	INodeTypeBaseDescription,
@@ -256,6 +257,93 @@ describe('HttpRequestV3', () => {
 		const body = (requestOptions.formData as FormData).getBuffer().toString('utf8');
 
 		expect(body).toContain('filename="file"');
+	});
+
+	describe('Multipart binary uploads from binary data storage', () => {
+		const getFormDataLength = async (formData: FormData) =>
+			await new Promise<number>((resolve, reject) => {
+				formData.getLength((error, length) => (error ? reject(error) : resolve(length)));
+			});
+
+		beforeEach(() => {
+			(executeFunctions.getNode as Mock).mockReturnValue({
+				type: 'n8n-nodes-base.httpRequest',
+				typeVersion: 4.4,
+			});
+			(executeFunctions.getInputData as Mock).mockReturnValue([{ json: {} }]);
+			(executeFunctions.getNodeParameter as Mock).mockImplementation((paramName: string) => {
+				switch (paramName) {
+					case 'method':
+						return 'POST';
+					case 'url':
+						return baseUrl;
+					case 'authentication':
+						return 'none';
+					case 'sendBody':
+						return true;
+					case 'contentType':
+						return 'multipart-form-data';
+					case 'specifyBody':
+						return 'keypair';
+					case 'bodyParameters.parameters':
+						return [
+							{
+								parameterType: 'formBinaryData',
+								// eslint-disable-next-line n8n-nodes-base/node-param-display-name-miscased
+								name: 'file',
+								value: '',
+								inputDataFieldName: 'data',
+							},
+						];
+					case 'options':
+						return options;
+					default:
+						return undefined;
+				}
+			});
+			(executeFunctions.helpers.request as Mock).mockResolvedValue({
+				headers: { 'content-type': 'application/json' },
+				body: Buffer.from(JSON.stringify({ success: true })),
+			});
+		});
+
+		it('should send an empty file with a measurable length', async () => {
+			(executeFunctions.helpers.assertBinaryData as Mock).mockReturnValue({
+				id: 'filesystem-v2:empty',
+				data: 'filesystem-v2',
+				fileName: 'empty.csv',
+				mimeType: 'text/csv',
+			});
+			(executeFunctions.helpers.getBinaryMetadata as Mock).mockResolvedValue({ fileSize: 0 });
+
+			await node.execute.call(executeFunctions);
+
+			const formData = (executeFunctions.helpers.request as Mock).mock.calls[0][0]
+				.formData as FormData;
+			expect(executeFunctions.helpers.getBinaryStream).not.toHaveBeenCalled();
+			expect(formData.hasKnownLength()).toBe(true);
+			await expect(getFormDataLength(formData)).resolves.toBe(formData.getBuffer().length);
+		});
+
+		it('should stream a non-empty file with its known length', async () => {
+			(executeFunctions.helpers.assertBinaryData as Mock).mockReturnValue({
+				id: 'filesystem-v2:file',
+				data: 'filesystem-v2',
+				fileName: 'file.csv',
+				mimeType: 'text/csv',
+			});
+			(executeFunctions.helpers.getBinaryMetadata as Mock).mockResolvedValue({ fileSize: 9 });
+			(executeFunctions.helpers.getBinaryStream as Mock).mockResolvedValue(
+				Readable.from([Buffer.from('test file')]),
+			);
+
+			await node.execute.call(executeFunctions);
+
+			const formData = (executeFunctions.helpers.request as Mock).mock.calls[0][0]
+				.formData as FormData;
+			expect(executeFunctions.helpers.getBinaryStream).toHaveBeenCalledWith('filesystem-v2:file');
+			expect(formData.hasKnownLength()).toBe(true);
+		});
 	});
 
 	describe('Authentication Handling', () => {
